@@ -1,63 +1,79 @@
 // ==UserScript==
 // @name         YouTube Shorts Blocker
 // @namespace    zen
-// @version      3.1
-// @description  Fully block all Shorts: redirects + feed removal + sidebar
+// @version      3.7
+// @description  Fully block all Shorts: redirects + feed + sidebar + no scroll jump
 // @match        *://*.youtube.com/*
-// @run-at       document-idle
-// @grant        none
+// @run-at       document-start
+// @grant        GM_addStyle
 // ==/UserScript==
 (function() {
     'use strict';
 
+    GM_addStyle(`
+        ytd-rich-shelf-renderer[is-shorts],
+        ytd-reel-shelf-renderer,
+        ytm-shorts-lockup-view-model,
+        ytm-shorts-lockup-view-model-v2,
+        ytd-rich-section-renderer:has(ytd-rich-shelf-renderer[is-shorts]),
+        ytd-rich-section-renderer:empty,
+        ytd-rich-section-renderer:not(:has(ytd-rich-shelf-renderer:not([is-shorts]))):not(:has(ytd-rich-item-renderer)) {
+            display: none !important;
+        }
+
+        ytd-rich-grid-renderer,
+        #contents.ytd-rich-grid-renderer,
+        ytd-page-manager {
+            overflow-anchor: none !important;
+        }
+    `);
+
+    // --- REDIRECT ---
     function redirectShorts() {
         if (/^https?:\/\/(www\.)?youtube\.com\/shorts/.test(window.location.href)) {
             window.location.href = 'https://www.youtube.com/feed/subscriptions';
         }
     }
     redirectShorts();
-
     const pushState = history.pushState;
     history.pushState = function() { pushState.apply(this, arguments); redirectShorts(); };
     const replaceState = history.replaceState;
     history.replaceState = function() { replaceState.apply(this, arguments); redirectShorts(); };
     window.addEventListener('yt-navigate-finish', redirectShorts);
 
+    // --- SIDEBAR ---
     function removeSidebar() {
         document.querySelectorAll('.yt-simple-endpoint[title="Shorts"]').forEach(el => {
-            if (el.parentNode && el.parentNode.parentNode) {
-                el.parentNode.parentNode.removeChild(el.parentNode);
-            }
+            if (el.parentNode?.parentNode) el.parentNode.parentNode.removeChild(el.parentNode);
         });
     }
 
+    // --- FEED ---
     function removeFeedShorts() {
-        // Remove reel shelf rows
-        document.querySelectorAll('ytd-reel-shelf-renderer, grid-shelf-view-model').forEach(el => {
-            el.parentNode && el.parentNode.removeChild(el);
-        });
+        const toRemove = new Set();
 
-        // Remove individual short items — and then clean up their empty section wrapper
-        document.querySelectorAll('[is-shorts], [is-reel-item-style-avatar-circle], ytd-reel-item-renderer').forEach(el => {
-            const section = el.closest('ytd-rich-section-renderer');
-            if (section && section.parentNode) {
-                section.parentNode.removeChild(section);
-            } else {
-                el.parentNode && el.parentNode.removeChild(el);
-            }
+        document.querySelectorAll('ytd-rich-shelf-renderer[is-shorts]').forEach(el => {
+            toRemove.add(el.closest('ytd-rich-section-renderer') || el);
         });
-
-        // Search results linking to /shorts/
-        document.querySelectorAll('ytd-video-renderer:has([href*="/shorts/"])').forEach(el => {
-            el.parentNode && el.parentNode.removeChild(el);
+        document.querySelectorAll('[is-shorts]').forEach(el => {
+            toRemove.add(el.closest('ytd-rich-section-renderer') || el);
         });
+        document.querySelectorAll(
+            'ytd-reel-shelf-renderer, ytm-shorts-lockup-view-model, ytm-shorts-lockup-view-model-v2'
+        ).forEach(el => toRemove.add(el));
+        document.querySelectorAll('ytd-video-renderer:has([href*="/shorts/"])').forEach(el => toRemove.add(el));
 
-        // Clean up any remaining empty ytd-rich-section-renderer containers
+        // Remove section wrappers that have no regular video content
         document.querySelectorAll('ytd-rich-section-renderer').forEach(el => {
-            if (!el.querySelector('ytd-rich-shelf-renderer:not([is-shorts])') && el.parentNode) {
-                el.parentNode.removeChild(el);
+            if (
+                !el.querySelector('ytd-rich-shelf-renderer:not([is-shorts])') &&
+                !el.querySelector('ytd-rich-item-renderer')
+            ) {
+                toRemove.add(el);
             }
         });
+
+        toRemove.forEach(el => el.parentNode && el.remove());
     }
 
     function removeAll() {
@@ -65,41 +81,47 @@
         removeFeedShorts();
     }
 
+    // --- OBSERVER ---
     let timeoutId;
-    function handleMutations(mutationsList) {
-        for (let mutation of mutationsList) {
+    function handleMutations(mutations) {
+        for (const mutation of mutations) {
+            if (mutation.type === 'attributes' && mutation.attributeName === 'is-shorts') {
+                clearTimeout(timeoutId);
+                timeoutId = setTimeout(removeAll, 100);
+                return;
+            }
             const t = mutation.target;
             if (
                 t.id === 'progress' ||
                 t.tagName === 'YTD-VIDEO-RENDERER' ||
+                t.tagName === 'YTD-RICH-SECTION-RENDERER' ||
                 (t.parentElement && (t.parentElement.id === 'page-manager' || t.parentElement.id === 'primary'))
             ) {
                 clearTimeout(timeoutId);
-                timeoutId = setTimeout(removeAll, 500);
-                break;
+                timeoutId = setTimeout(removeAll, 300);
+                return;
             }
         }
     }
 
     function init() {
         removeAll();
-        const targetNode = document.querySelector('#page-manager');
-        if (targetNode) {
-            const observer = new MutationObserver(handleMutations);
-            observer.observe(targetNode, { childList: true, attributes: true, subtree: true });
-        }
+        const target = document.querySelector('#page-manager') || document.body;
+        new MutationObserver(handleMutations).observe(target, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['is-shorts'],
+        });
     }
 
     if (document.querySelector('#page-manager')) {
         init();
     } else {
-        const waitForPageManager = new MutationObserver(() => {
-            if (document.querySelector('#page-manager')) {
-                waitForPageManager.disconnect();
-                init();
-            }
+        const wait = new MutationObserver(() => {
+            if (document.querySelector('#page-manager')) { wait.disconnect(); init(); }
         });
-        waitForPageManager.observe(document.body, { childList: true, subtree: true });
+        wait.observe(document.body || document.documentElement, { childList: true, subtree: true });
     }
 
 })();
